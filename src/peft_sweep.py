@@ -297,10 +297,11 @@ def main():
         output_dir=args.output_dir,
 
         num_train_epochs=args.epochs,
-        per_device_train_batch_size=4,  # ADJUST
+        per_device_train_batch_size=16,  # ADJUST -- bumped from 4; A100 80GB was only at 20GB/80GB (25%) with batch_size=4
         gradient_accumulation_steps=1,   # ADJUST
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},
+        dataloader_num_workers=4,  # keep the GPU fed while CPU tokenizes the next batch (was seeing 87% util, not ~100%)
 
         # ADJUST
         learning_rate=2e-4,

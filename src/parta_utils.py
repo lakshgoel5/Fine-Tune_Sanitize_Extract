@@ -12,6 +12,7 @@ import argparse
 import matplotlib.pyplot as plt
 import csv
 import json
+import os
 from dataclasses import dataclass
 from typing import Optional
 
