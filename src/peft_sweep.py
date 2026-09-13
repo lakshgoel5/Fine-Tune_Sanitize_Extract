@@ -224,6 +224,44 @@ def main():
     train_dataset = CustomDataset(train_examples, tokenizer, max_len=args.max_len)
     val_dataset = CustomDataset(val_examples, tokenizer, max_len=args.max_len)
     collator = DataCollator(tokenizer=tokenizer)
+
+    training_args = TrainingArguments(
+        output_dir=args.output_dir,
+        overwrite_output_dir=True,
+
+        num_train_epochs=args.epochs,
+        per_device_train_batch_size=4,  # ADJUST
+        gradient_accumulation_steps=1,   # ADJUST
+        gradient_checkpointing=True,
+        gradient_checkpointing_kwargs={"use_reentrant": False},
+
+        # ADJUST
+        learning_rate=2e-4,
+        lr_scheduler_type="cosine",
+        warmup_ratio=0.03,
+
+        logging_dir='./logs',
+        logging_steps=10,
+        save_strategy="epoch",
+        load_best_model_at_end=True,
+        evaluation_strategy="epoch",
+        save_total_limit=1, # ADJUST if you want to do some experiment
+
+        seed=args.seed,
+    )
+
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset,
+        eval_dataset=val_dataset,
+        data_collator=collator,
+    )
+
+    # Training Setup Done
+
+    # Collect data
+
     return
 
 
