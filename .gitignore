@@ -1,0 +1,33 @@
+# do not ship adapters, base models, full corpus text, generation dumps, or wandb/run directories.
+adapters/
+checkpoints/
+generations/
+wandb/
+runs/
+*.ckpt
+*.safetensors
+*.bin
+*.pt
+
+# Large derived data (locally created sanitized corpus, per the spec)
+data/partC_corpus_sanitized.jsonl
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+.ipynb_checkpoints/
+
+# OS / editor cruft
+.DS_Store
+.idea/
+.vscode/
+
+# Logs and caches
+*.log
+.cache/
+.pytest_cache/
