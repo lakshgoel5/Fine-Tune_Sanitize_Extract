@@ -6,12 +6,14 @@ Evaluates on partA_validation.jsonl, and appends one row to --results_csv.
 """
 
 import argparse
+from dataclasses import dataclass
 
 import torch
-from transformers import AutoTokenizer, set_seed, AutoModelForCausalLM, BitsAndBytesConfig
+from torch.utils.data import Dataset
+from transformers import AutoTokenizer, set_seed, AutoModelForCausalLM, BitsAndBytesConfig, Trainer, TrainingArguments
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 
-from parta_utils import load_jsonl, parse_examples, trainable_param_stats
+from parta_utils import load_jsonl, parse_examples, trainable_param_stats, build_chat_prompt
 
 """
 What is QLoRA?
@@ -20,6 +22,118 @@ Once loaded, these 4-bit base weights are frozen and are not updated during the 
 QLoRA often utilizes paged optimizers to automatically evict optimizer states to CPU RAM when GPU memory spikes, preventing out-of-memory errors during training.
 --quant 4bit to set to QLoRA mode
 """
+
+class CustomDataset(Dataset):
+    """
+    Returns plain python lists (NOT padded, NOT tensors yet) -- padding is a
+    batch-level concern and belongs in DataCollator, not here.
+
+    Worked example:
+        ex.source_text = "Hi Bob"
+        ex.target_text = "Hi [GIVENNAME1]"
+
+        prompt = build_chat_prompt(...)              # "<sys>...<user>Hi Bob<assistant>"
+        full   = prompt + target_text + eos_token     # "<sys>...<user>Hi Bob<assistant>Hi [GIVENNAME1]<eos>"
+
+        prompt_ids = [1, 2, 3, 4, 5]                   # 5 tokens covering system+user+assistant-start
+        full_ids   = [1, 2, 3, 4, 5, 6, 7, 8, 9]        # + "Hi"(6) "[GIVENNAME1]"(7,8) eos(9)
+        prompt_len = 5
+
+        labels = [-100, -100, -100, -100, -100, 6, 7, 8, 9]
+        #         |------- prompt, no loss -------|  |-- completion, loss here --|
+
+        returned dict -> {
+            "input_ids":      [1, 2, 3, 4, 5, 6, 7, 8, 9],
+            "attention_mask": [1, 1, 1, 1, 1, 1, 1, 1, 1],   # all 1s -- no padding exists yet
+            "labels":         [-100, -100, -100, -100, -100, 6, 7, 8, 9],
+        }
+    """
+
+    def __init__(self, examples, tokenizer, max_len: int = 1024):
+        self.examples = examples
+        self.tokenizer = tokenizer
+        self.max_len = max_len
+
+    def __len__(self):
+        return len(self.examples)
+
+    def __getitem__(self, idx):
+        ex = self.examples[idx]
+        prompt = build_chat_prompt(self.tokenizer, ex.source_text)
+        full = prompt + ex.target_text + self.tokenizer.eos_token
+
+        # add_special_tokens=False: apply_chat_template already inserted any special tokens (e.g. <|im_start|>) we need.
+        prompt_ids = self.tokenizer(prompt, add_special_tokens=False)["input_ids"]
+        full_ids = self.tokenizer(full, add_special_tokens=False)["input_ids"][: self.max_len]
+
+        labels = list(full_ids)
+        prompt_len = min(len(prompt_ids), len(full_ids))  # guard against truncation cutting into the prompt
+        for i in range(prompt_len):
+            labels[i] = -100  # mask prompt tokens out of the loss
+
+        return {
+            "input_ids": full_ids,
+            "attention_mask": [1] * len(full_ids),
+            "labels": labels,
+        }
+
+
+@dataclass
+class DataCollator:
+    """
+    Batch-level work only: takes a list of already-tokenized, variable-length
+    dicts (one per example, from CustomDataset.__getitem__) and pads them to
+    the longest example in THIS batch (not a fixed global max_len -- keeps
+    compute down on batches that happen to be shorter), then stacks into
+    tensors.
+
+    Right-padded by hand regardless of tokenizer.padding_side, since that
+    attribute is set to "left" globally (for generation) and we don't want
+    that to leak into how training batches get padded.
+
+    Worked example, continuing from CustomDataset's example above -- say the
+    batch has 2 examples, A (len 9, from the example above) and a shorter B:
+        batch = [
+            {"input_ids": [1,2,3,4,5,6,7,8,9], "attention_mask": [1]*9,
+             "labels":    [-100,-100,-100,-100,-100,6,7,8,9]},                    # A, len 9
+            {"input_ids": [1,2,3,4,5,6,7],     "attention_mask": [1]*7,
+             "labels":    [-100,-100,-100,-100,-100,6,7]},                        # B, len 7
+        ]
+
+        batch_max_len = 9   # longest example in THIS batch (not a fixed max_len)
+        pad_len for B = 9 - 7 = 2   (pad_token_id here is, say, 0)
+
+        padded B -> input_ids:      [1,2,3,4,5,6,7, 0,0]        # 0 = pad_token_id
+                    attention_mask: [1,1,1,1,1,1,1, 0,0]        # 0s = "don't attend to these"
+                    labels:         [-100,-100,-100,-100,-100,6,7, -100,-100]   # -100, never pad_token_id, so pads never contribute to loss
+
+        A needs no padding (already at batch_max_len), so it passes through unchanged.
+
+        final stacked tensors, shape (batch_size=2, batch_max_len=9):
+            input_ids      = [[1,2,3,4,5,6,7,8,9],
+                               [1,2,3,4,5,6,7,0,0]]
+            attention_mask = [[1,1,1,1,1,1,1,1,1],
+                               [1,1,1,1,1,1,1,0,0]]
+            labels          = [[-100,-100,-100,-100,-100,6,7,8,9],
+                               [-100,-100,-100,-100,-100,6,7,-100,-100]]
+    """
+    tokenizer: object
+
+    def __call__(self, batch: list) -> dict:
+        batch_max_len = max(len(item["input_ids"]) for item in batch)
+        input_ids, attention_mask, labels = [], [], []
+        for item in batch:
+            pad_len = batch_max_len - len(item["input_ids"])
+            input_ids.append(item["input_ids"] + [self.tokenizer.pad_token_id] * pad_len)
+            attention_mask.append(item["attention_mask"] + [0] * pad_len)
+            labels.append(item["labels"] + [-100] * pad_len)  # -100, not pad_token_id, so pads never contribute to loss
+
+        return {
+            "input_ids": torch.tensor(input_ids, dtype=torch.long),
+            "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
+            "labels": torch.tensor(labels, dtype=torch.long),
+        }
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Run one PEFT sweep configuration for the sanitizer.")
@@ -36,6 +150,7 @@ def parse_args():
     parser.add_argument("--run_id", type=str, required=True, help="Sweep run identifier, e.g. A4")
     parser.add_argument("--output_dir", type=str, default="./Adapters", help="Directory to save the trained adapter")
     parser.add_argument("--results_csv", type=str, default="./results/parta/partA_sweep.csv", help="CSV file to append the results row to")
+    parser.add_argument("--max_len", type=int, default=1024, help="Max tokens per training example (prompt+target), truncated beyond this")
     return parser.parse_args()
 
 def build_model(args):
@@ -91,10 +206,11 @@ def main():
 
     # Tokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.model)
-
-    # Data
-    train_examples = parse_examples(load_jsonl(args.train_file))
-    val_examples = parse_examples(load_jsonl(args.val_file))
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    # for training/fine tuning, Standard practice for loss masking is to pad on right, but for generation, we need to pad on left.
+    tokenizer.padding_side = "left"  # required for correct batched generate() slicing
+    # While training, custom collate_fn will handle padding, so we don't need to care about tokenizer.padding_side for training. We are setting it to "left" here for generation during evaluation.
 
     # Model (including Lora config)
     model = build_model(args)
@@ -102,6 +218,12 @@ def main():
 
     print(f"Trainable parameters: {trainable}, Total parameters: {total}")
 
+    # Data
+    train_examples = parse_examples(load_jsonl(args.train_file))
+    val_examples = parse_examples(load_jsonl(args.val_file))
+    train_dataset = CustomDataset(train_examples, tokenizer, max_len=args.max_len)
+    val_dataset = CustomDataset(val_examples, tokenizer, max_len=args.max_len)
+    collator = DataCollator(tokenizer=tokenizer)
     return
 
 
