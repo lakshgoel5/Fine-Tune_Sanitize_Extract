@@ -319,7 +319,6 @@ def main():
 
     trainer = TokenCountingTrainer(
         model=model,
-        overwrite_output_dir=True,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
