@@ -43,3 +43,5 @@ report.pdf
 *.tex
 .markdownlint*
 temp.py
+results/
+setup.md
