@@ -4,3 +4,11 @@ Fine-tuning LLMs on unvetted data often leads to the unintended inclusion of pri
 
 ### Authors
 - Laksh Goel (2023CS10848)
+
+# Commands
+
+## Report Generation
+```bash
+pdflatex report.tex
+```
+
