@@ -1,0 +1,14 @@
+# Install torch separately first (see README / setup instructions) -- the correct
+# build depends on the server's CUDA version, so it's not pinned here.
+transformers>=4.46
+accelerate>=0.33
+peft>=0.11
+bitsandbytes>=0.43
+trl>=0.9
+datasets>=2.19
+matplotlib>=3.7
+seaborn>=0.13
+presidio-analyzer>=2.2
+presidio-anonymizer>=2.2
+spacy>=3.7
+wandb>=0.17
