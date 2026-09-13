@@ -31,3 +31,14 @@ env/
 *.log
 .cache/
 .pytest_cache/
+
+# LaTeX build artifacts
+*.aux
+*.out
+*.toc
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+report.pdf
+*.tex
+.markdownlint*
