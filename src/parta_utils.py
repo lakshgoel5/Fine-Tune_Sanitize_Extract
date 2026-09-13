@@ -132,25 +132,28 @@ def plot(results_csv, output_dir):
             rows.append(r)
  
     fig, axes = plt.subplots(1, 2, figsize=(11, 4.5))
- 
+
+    LABEL_OFFSETS = [(6, 4), (6, -14), (-28, 4), (6, 16), (-28, -14), (-28, 16)]
+
     ax = axes[0]
-    for r in rows:
+    for i, r in enumerate(rows):
         x = float(r["trainable_pct"])
         y = float(r["val_entity_f1"])
         ax.scatter(x, y, s=60)
-        ax.annotate(r["run_id"], (x, y), textcoords="offset points", xytext=(6, 4))
+        ax.annotate(r["run_id"], (x, y), textcoords="offset points",
+                    xytext=LABEL_OFFSETS[i % len(LABEL_OFFSETS)])
     ax.set_xscale("log")
     ax.set_xlabel("Trainable parameters (%) [log scale]")
     ax.set_ylabel("Validation entity F1 (IoU>=0.5)")
     ax.set_title("F1 vs. trainable-parameter budget")
     ax.grid(True, which="both", alpha=0.3)
- 
+
     ax = axes[1]
-    for r in rows:
+    for i, r in enumerate(rows):
         x = float(r["val_entity_f1"])
         y = float(r["peak_gpu_mem_gb"])
         ax.scatter(x, y, s=60)
-        ax.annotate(r["run_id"], (x, y), textcoords="offset points", xytext=(6, 4))
+        ax.annotate(r["run_id"], (x, y), textcoords="offset points", xytext=LABEL_OFFSETS[i % len(LABEL_OFFSETS)])
     ax.set_xlabel("Validation entity F1 (IoU>=0.5)")
     ax.set_ylabel("Peak GPU memory (GB)")
     ax.set_title("Memory vs. F1")
