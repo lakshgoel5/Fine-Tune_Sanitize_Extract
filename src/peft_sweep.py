@@ -17,7 +17,7 @@ from torch.utils.data import Dataset
 from transformers import AutoTokenizer, set_seed, AutoModelForCausalLM, BitsAndBytesConfig, Trainer, TrainingArguments
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 
-from parta_utils import load_jsonl, parse_examples, trainable_param_stats, build_chat_prompt
+from parta_utils import load_jsonl, parse_examples, trainable_param_stats, build_chat_prompt, append_csv_row
 from metrics import recover_predicted_spans, match_counts_iou, micro_prf1, count_leaks
 
 """
@@ -176,15 +176,8 @@ def parse_args():
 
 def build_model(args):
     use_cuda = torch.cuda.is_available()
-    use_mps = torch.backends.mps.is_available() and torch.backends.mps.is_built()
-    if use_cuda:
-        device = "cuda"
-    elif use_mps:
-        device = "mps"
-    else:
-        device = "cpu"
-
-    dtype = torch.float16 if (use_cuda or use_mps) else torch.float32 #TUNE based on GPU and memory
+    device = "cuda" if use_cuda else "cpu"
+    dtype = torch.float16 if (use_cuda) else torch.float32 #TUNE based on GPU and memory
 
     quant_config = None
     if args.quant == "4bit":
@@ -319,7 +312,7 @@ def main():
         logging_steps=10,
         save_strategy="epoch",
         load_best_model_at_end=True,
-        evaluation_strategy="epoch",
+        eval_strategy="epoch",  # "evaluation_strategy" was renamed 
         save_total_limit=1, # ADJUST if you want to do some experiment
 
         seed=args.seed,
