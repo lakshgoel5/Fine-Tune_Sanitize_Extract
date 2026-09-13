@@ -59,6 +59,53 @@ def parse_examples(rows: list[dict]) -> list[Example]:
         )
     return out
 
+# Closed label vocabulary observed in data/partA_train.jsonl + partA_validation.jsonl
+# (27 labels; a 28th, CARDISSUER, appears exactly once and is treated as noise,
+# not a real category). data/partB_test.jsonl uses this same 27-label schema.
+# data/partB_ood_test.jsonl uses a DIFFERENT, disjoint label vocabulary (its own
+# ~56 labels, e.g. FIRSTNAME/PHONENUMBER/DOB instead of GIVENNAME1/TEL/BOD) --
+# do not add those names here; evaluating with this same list on the OOD set is
+# the intended (and informative) test.
+PII_LABELS = [
+    "BOD", "BUILDING", "CITY", "COUNTRY", "DATE", "DRIVERLICENSE", "EMAIL",
+    "GEOCOORD", "GIVENNAME1", "GIVENNAME2", "IDCARD", "IP", "LASTNAME1",
+    "LASTNAME2", "LASTNAME3", "PASS", "PASSPORT", "POSTCODE", "SECADDRESS",
+    "SEX", "SOCIALNUMBER", "STATE", "STREET", "TEL", "TIME", "TITLE",
+    "USERNAME",
+]
+
+SYSTEM_PROMPT = (
+    "You are a privacy sanitizer. Rewrite the user's text, replacing every span "
+    "that contains personally identifiable information (PII) with a bracketed "
+    "label naming its category, using ONLY the following fixed set of labels "
+    "(uppercase, exactly as written, no other labels): "
+    + ", ".join(f"[{l}]" for l in PII_LABELS) + ". "
+    "GIVENNAME1/GIVENNAME2 and LASTNAME1/LASTNAME2/LASTNAME3 are separate labels "
+    "for distinct name slots (e.g. different people or first vs. middle name) -- "
+    "use the correct numbered label, not a generic one. Do not change anything "
+    "else about the text -- preserve all formatting, punctuation, and non-PII "
+    "content exactly. Output only the sanitized text, with no extra commentary."
+)
+
+
+def build_chat_prompt(tokenizer, source_text: str) -> str:
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": source_text},
+    ]
+    #tokenize=False: Tells the tokenizer to return a formatted string instead of a list of integer token IDs.
+    #add_generation_prompt=True: Appends a generation prompt to the end of the user message
+    return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+
+def trainable_param_stats(model):
+    trainable, total = 0, 0
+    for p in model.parameters():
+        n = p.numel()
+        total += n
+        if p.requires_grad:
+            trainable += n
+    return trainable, total
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Run one PEFT sweep configuration for the sanitizer.")
     parser.add_argument("--mode", type=str, choices=["plot"], default="plot", help="")

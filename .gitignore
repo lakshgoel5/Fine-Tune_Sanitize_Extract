@@ -42,3 +42,4 @@ env/
 report.pdf
 *.tex
 .markdownlint*
+temp.py
