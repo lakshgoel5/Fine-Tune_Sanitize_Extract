@@ -7,6 +7,13 @@ Evaluates on partA_validation.jsonl, and appends one row to --results_csv.
 
 import argparse
 
+"""
+What is QLoRA?
+QLoRA loads the massive, pre-trained base model weights in a highly compressed 4-bit format (specifically, 4-bit NormalFloat)
+Once loaded, these 4-bit base weights are frozen and are not updated during the training process.
+QLoRA often utilizes paged optimizers to automatically evict optimizer states to CPU RAM when GPU memory spikes, preventing out-of-memory errors during training.
+--quant 4bit to set to QLoRA mode
+"""
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Run one PEFT sweep configuration for the sanitizer.")
