@@ -305,9 +305,8 @@ def main():
         # ADJUST
         learning_rate=2e-4,
         lr_scheduler_type="cosine",
-        warmup_ratio=0.03,
+        warmup_steps=0.03,  # v5: float <1 means ratio, same behavior as warmup_ratio
 
-        logging_dir='./logs',
         logging_steps=10,
         save_strategy="epoch",
         load_best_model_at_end=True,
