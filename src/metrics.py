@@ -5,6 +5,7 @@ scoring during the PEFT sweep) and Part B (full sanitizer evaluation).
 
 import difflib
 import re
+from collections import defaultdict
 from dataclasses import dataclass
 
 TAG_RE = re.compile(r"\[([A-Z0-9_]+)\]")
@@ -15,6 +16,34 @@ class PredSpan:
     end: int
     label: str
 
+def _is_real_anchor(tag, i1, i2, source_text, min_equal_len):
+    if tag != "equal":
+        return False
+    if (i2 - i1) >= min_equal_len:
+        return True
+    return not source_text[i1:i2].isalnum()
+
+def _coalesce_opcodes(opcodes, source_text: str, min_equal_len: int = 3):
+    merged = []
+    buf = None  # [i1, i2, j1, j2] of an in-progress merged non-equal region
+    for tag, i1, i2, j1, j2 in opcodes:
+        if _is_real_anchor(tag, i1, i2, source_text, min_equal_len):
+            if buf is not None:
+                merged.append(("replace", buf[0], buf[1], buf[2], buf[3]))
+                buf = None
+            merged.append((tag, i1, i2, j1, j2))
+        else:
+            # insert / delete / replace, AND short-alphanumeric "equal" noise --
+            # all accumulate into one running merged region until the next real anchor.
+            if buf is None:
+                buf = [i1, i2, j1, j2]
+            else:
+                buf[1], buf[3] = i2, j2
+    if buf is not None:
+        merged.append(("replace", buf[0], buf[1], buf[2], buf[3]))
+    return merged
+
+
 def recover_predicted_spans(source_text: str, predicted_text: str) -> list[PredSpan]:
     """Align predicted_text against source_text and turn each replaced gap
     that contains a [LABEL] tag into a (start, end, label) span in
@@ -22,7 +51,7 @@ def recover_predicted_spans(source_text: str, predicted_text: str) -> list[PredS
     """
     sm = difflib.SequenceMatcher(None, source_text, predicted_text, autojunk=False)
     spans: list[PredSpan] = []
-    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+    for tag, i1, i2, j1, j2 in _coalesce_opcodes(sm.get_opcodes(), source_text):
         if tag == "equal":
             continue
         # i1:i2 is the gap in source_text; j1:j2 is what replaced it in predicted_text.
@@ -71,6 +100,88 @@ def micro_prf1(tp: int, fp: int, fn: int) -> tuple[float, float, float]:
     f1 = 2 * p * r / (p + r) if (p + r) > 0 else 0.0
     return p, r, f1
 
+def is_match(p: PredSpan, g: dict) -> bool:
+    if g["label"] != p.label:
+        return False
+    if mode == "exact":
+        return p.start == g["start"] and p.end == g["end"]
+    return _iou(p.start, p.end, g["start"], g["end"]) >= iou_threshold
+
+def score(p: PredSpan, g: dict) -> float:
+    return 1.0 if mode == "exact" else _iou(p.start, p.end, g["start"], g["end"])
+
+def match_spans_by_class(pred_spans: list[PredSpan], gold_spans: list[dict], mode: str = "iou", iou_threshold: float = 0.5) -> dict:
+    counts = defaultdict(lambda: [0, 0, 0])  # label -> [tp, fp, fn]
+    unmatched_gold = list(range(len(gold_spans)))
+    for p in pred_spans:
+        best_j, best_score = None, -1.0
+        for j in unmatched_gold:
+            g = gold_spans[j]
+            if is_match(p, g):
+                s = score(p, g)
+                if s > best_score:
+                    best_j, best_score = j, s
+        if best_j is not None:
+            counts[p.label][0] += 1  # tp
+            unmatched_gold.remove(best_j)
+        else:
+            counts[p.label][1] += 1  # fp
+    for j in unmatched_gold:
+        counts[gold_spans[j]["label"]][2] += 1  # fn
+    return dict(counts)
+
+
+def merge_class_counts(*count_dicts: dict) -> dict:
+    merged = defaultdict(lambda: [0, 0, 0])
+    for counts in count_dicts:
+        for label, (tp, fp, fn) in counts.items():
+            merged[label][0] += tp
+            merged[label][1] += fp
+            merged[label][2] += fn
+    return dict(merged)
+
+
+def aggregate_prf1(class_counts: dict) -> dict:
+    tp_sum = sum(c[0] for c in class_counts.values())
+    fp_sum = sum(c[1] for c in class_counts.values())
+    fn_sum = sum(c[2] for c in class_counts.values())
+    micro_p, micro_r, micro_f1 = micro_prf1(tp_sum, fp_sum, fn_sum)
+
+    per_class = {}
+    for label, (tp, fp, fn) in class_counts.items():
+        p, r, f1 = micro_prf1(tp, fp, fn)
+        per_class[label] = {"p": p, "r": r, "f1": f1, "support": tp + fn}
+    macro_f1 = sum(c["f1"] for c in per_class.values()) / len(per_class) if per_class else 0.0
+
+    return {
+        "micro_p": micro_p, "micro_r": micro_r, "micro_f1": micro_f1,
+        "macro_f1": macro_f1, "per_class": per_class,
+    }
+
+
+def over_masking_rate(source_text: str, predicted_text: str, gold_spans: list[dict]) -> tuple[int, int]:
+    gold_mask = [False] * len(source_text)
+    for g in gold_spans:
+        for i in range(max(0, g["start"]), min(g["end"], len(source_text))):
+            gold_mask[i] = True
+
+    altered_mask = [False] * len(source_text)
+    sm = difflib.SequenceMatcher(None, source_text, predicted_text, autojunk=False)
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag != "equal":
+            for i in range(i1, i2):
+                altered_mask[i] = True
+
+    n_total = 0
+    n_altered = 0
+    for i in range(len(source_text)):
+        if gold_mask[i]:
+            continue
+        n_total += 1
+        if altered_mask[i]:
+            n_altered += 1
+    return n_altered, n_total
+
 
 def _normalize(s: str) -> str:
     return " ".join(s.split()).lower()
@@ -88,3 +199,12 @@ def count_leaks(gold_spans: list[dict], predicted_text: str) -> tuple[int, int]:
         if _normalize(value) in norm_pred:
             leaked += 1
     return leaked, len(gold_spans)
+
+
+def is_well_formed(source_text: str, predicted_text: str, min_len_ratio: float = 0.5, max_len_ratio: float = 1.5) -> bool:
+    if not predicted_text.strip():
+        return False
+    if not source_text:
+        return True
+    ratio = len(predicted_text) / len(source_text)
+    return min_len_ratio <= ratio <= max_len_ratio
