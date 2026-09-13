@@ -6,7 +6,10 @@ Evaluates on partA_validation.jsonl, and appends one row to --results_csv.
 """
 
 import argparse
-from dataclasses import dataclass
+import csv
+import os
+import time
+from dataclasses import dataclass, asdict
 
 import torch
 from torch.utils.data import Dataset
@@ -14,6 +17,7 @@ from transformers import AutoTokenizer, set_seed, AutoModelForCausalLM, BitsAndB
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 
 from parta_utils import load_jsonl, parse_examples, trainable_param_stats, build_chat_prompt
+from metrics import recover_predicted_spans, match_counts_iou, micro_prf1, count_leaks
 
 """
 What is QLoRA?
@@ -133,6 +137,21 @@ class DataCollator:
             "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
             "labels": torch.tensor(labels, dtype=torch.long),
         }
+    
+class TokenCountingTrainer(Trainer):
+    """
+    sum attention_mask over every training micro-batch, so we can report tokens_per_s = total_tokens_seen / wallclock_s
+    Counting REAL (non-pad) tokens via attention_mask, not input_ids.numel()
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.total_tokens_seen = 0
+
+    def training_step(self, model, inputs, *args, **kwargs):
+        self.total_tokens_seen += inputs["attention_mask"].sum().item()
+        return super().training_step(model, inputs, *args, **kwargs)
+
 
 
 def parse_args():
@@ -250,7 +269,7 @@ def main():
         seed=args.seed,
     )
 
-    trainer = Trainer(
+    trainer = TokenCountingTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
@@ -261,6 +280,41 @@ def main():
     # Training Setup Done
 
     # Collect data
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()  # so max_memory_allocated() below reflects THIS run only
+
+    start = time.time()
+    train_result = trainer.train()  # restores the best (lowest eval_loss by default) checkpoint, since load_best_model_at_end=True
+    wallclock_s = time.time() - start
+
+    peak_mem_gb = torch.cuda.max_memory_allocated() / 1e9 if torch.cuda.is_available() else 0.0
+    tokens_per_s = trainer.total_tokens_seen / wallclock_s if wallclock_s > 0 else 0.0
+
+    # Validation
+    eval_metrics = trainer.evaluate()  # teacher-forced val_loss (no generation)
+    val_f1, val_leak_rate = run_validation(model, tokenizer, val_examples)
+
+    # Save
+    model.save_pretrained(args.output_dir)
+    row = {
+        "run_id": args.run_id,
+        "method": "QLoRA" if args.quant == "4bit" else "LoRA",
+        "target_modules": args.target_modules,
+        "lora_r": args.lora_r,
+        "lora_alpha": args.lora_alpha,
+        "quant": args.quant,
+        "trainable_params": trainable,
+        "total_params": total,
+        "trainable_pct": 100.0 * trainable / total if total > 0 else 0.0,
+        "peak_gpu_mem_gb": peak_mem_gb,
+        "train_wallclock_s": wallclock_s,
+        "tokens_per_s": tokens_per_s,
+        "final_train_loss": train_result.training_loss,
+        "val_loss": eval_metrics.get("eval_loss"),
+        "val_entity_f1": val_f1,
+        "val_leak_rate": val_leak_rate,
+    }
+    append_csv_row(args.results_csv, row)
 
     return
 

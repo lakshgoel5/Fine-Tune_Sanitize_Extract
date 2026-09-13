@@ -106,6 +106,17 @@ def trainable_param_stats(model):
             trainable += n
     return trainable, total
 
+def append_csv_row(path: str, row: dict):
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    file_exists = os.path.exists(path)
+    with open(path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(row)
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Run one PEFT sweep configuration for the sanitizer.")
     parser.add_argument("--mode", type=str, choices=["plot"], default="plot", help="")
