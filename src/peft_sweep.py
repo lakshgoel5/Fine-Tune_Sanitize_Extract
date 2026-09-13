@@ -219,6 +219,57 @@ def build_model(args):
     model.print_trainable_parameters()
     return model
 
+@torch.no_grad()
+def run_validation(model, tokenizer, val_examples, batch_size: int = 8, margin: int = 32): #ADJUST batch_size and margin based on GPU memory
+    """
+    Generation-based validation scoring -- separate from trainer.evaluate()'s
+    val_loss (that's teacher-forced, no generation involved).
+
+    max_new_tokens is sized per-batch from the longest source_text in that
+    batch (+ margin), not a fixed global constant -- target_text is roughly as
+    long as source_text (spans just shrink to [LABEL] tags), so a fixed cap
+    would truncate long documents and unfairly tank their F1/leak numbers.
+    """
+    model.eval()
+    device = next(model.parameters()).device
+    tp_sum = fp_sum = fn_sum = 0
+    leaked_sum = total_sum = 0
+
+    for i in range(0, len(val_examples), batch_size):
+        batch = val_examples[i: i + batch_size]
+        prompts = [build_chat_prompt(tokenizer, ex.source_text) for ex in batch]
+        # padding=True here relies on tokenizer.padding_side == "left" (set in main())
+        # so every prompt in the batch ends at the same index -> uniform slice point below.
+        enc = tokenizer(prompts, return_tensors="pt", padding=True, add_special_tokens=False).to(device)
+
+        source_lens = [len(tokenizer(ex.source_text, add_special_tokens=False)["input_ids"]) for ex in batch]
+        max_new_tokens = max(source_lens) + margin
+
+        out = model.generate(
+            **enc,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,  # greedy: deterministic, reproducible model-selection signal
+            pad_token_id=tokenizer.pad_token_id,
+        )
+        gen_only = out[:, enc["input_ids"].shape[1]:]  # left-padded prompts -> uniform slice point for all rows
+        decoded = tokenizer.batch_decode(gen_only, skip_special_tokens=True)
+
+        for ex, pred_text in zip(batch, decoded):
+            gold_spans = [asdict(s) for s in ex.privacy_mask]
+            pred_spans = recover_predicted_spans(ex.source_text, pred_text)
+            tp, fp, fn = match_counts_iou(pred_spans, gold_spans, iou_threshold=0.5)
+            tp_sum += tp
+            fp_sum += fp
+            fn_sum += fn
+            leaked, total = count_leaks(gold_spans, pred_text)
+            leaked_sum += leaked
+            total_sum += total
+
+    _, _, f1 = micro_prf1(tp_sum, fp_sum, fn_sum)
+    leak_rate = leaked_sum / total_sum if total_sum > 0 else 0.0
+    model.train()
+    return f1, leak_rate
+
 def main():
     args = parse_args()
     set_seed(args.seed)
