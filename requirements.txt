@@ -1,6 +1,6 @@
 # Install torch separately first (see README / setup instructions) -- the correct
 # build depends on the server's CUDA version, so it's not pinned here.
-transformers>=4.46
+transformers>=5.0,<6.0
 accelerate>=0.33
 peft>=0.11
 bitsandbytes>=0.43
