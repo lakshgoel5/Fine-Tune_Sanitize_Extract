@@ -10,6 +10,7 @@ import csv
 import os
 import time
 from dataclasses import dataclass, asdict
+import wandb
 
 import torch
 from torch.utils.data import Dataset
@@ -170,6 +171,7 @@ def parse_args():
     parser.add_argument("--output_dir", type=str, default="./Adapters", help="Directory to save the trained adapter")
     parser.add_argument("--results_csv", type=str, default="./results/parta/partA_sweep.csv", help="CSV file to append the results row to")
     parser.add_argument("--max_len", type=int, default=1024, help="Max tokens per training example (prompt+target), truncated beyond this")
+    parser.add_argument("--wandb", action="store_true", help="Log this run to Weights & Biases (off by default)")
     return parser.parse_args()
 
 def build_model(args):
@@ -274,6 +276,9 @@ def main():
     args = parse_args()
     set_seed(args.seed)
 
+    if args.wandb:
+        wandb.init(project="col873-a1-parta", name=args.run_id, config=vars(args))
+
     # Tokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     if tokenizer.pad_token is None:
@@ -318,6 +323,7 @@ def main():
         save_total_limit=1, # ADJUST if you want to do some experiment
 
         seed=args.seed,
+        report_to=["wandb"] if args.wandb else [],
     )
 
     trainer = TokenCountingTrainer(
@@ -367,6 +373,10 @@ def main():
     }
     append_csv_row(args.results_csv, row)
 
+    # Wandb
+    if args.wandb:
+        wandb.log(row)
+        wandb.finish()
     return
 
 
