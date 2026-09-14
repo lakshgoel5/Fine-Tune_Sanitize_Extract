@@ -27,8 +27,7 @@ done
 [ $missing -eq 0 ] || { echo "Aborting: required files missing."; exit 1; }
 
 # Docs and report
-cp README.md requirements.txt run_all.sh report.pdf report.tex "$STAGE/"
-cp -r assets "$STAGE/" 2>/dev/null || true   # figures used by report.tex
+cp README.md requirements.txt run_all.sh report.pdf "$STAGE/"
 
 # All source files: the four required scripts import the helper modules
 cp src/*.py "$STAGE/src/"

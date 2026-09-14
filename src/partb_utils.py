@@ -9,6 +9,19 @@ from metrics import PredSpan, recover_predicted_spans
 from parta_utils import SYSTEM_PROMPT, load_jsonl
 
 
+# Near-OOD (ai4privacy-200k) label -> our 27-label schema, only where the meaning clearly matches.
+# Labels not listed (IBAN, AMOUNT, JOBTITLE, BITCOINADDRESS, ...) have no counterpart the model was trained on.
+OOD_LABEL_MAP = {
+    "DATE": "DATE", "EMAIL": "EMAIL", "TIME": "TIME", "CITY": "CITY", "STATE": "STATE",
+    "STREET": "STREET", "USERNAME": "USERNAME", "SEX": "SEX", "IP": "IP",
+    "FIRSTNAME": "GIVENNAME1", "MIDDLENAME": "GIVENNAME2", "LASTNAME": "LASTNAME1",
+    "PHONENUMBER": "TEL", "IPV4": "IP", "IPV6": "IP", "SSN": "SOCIALNUMBER", "DOB": "BOD",
+    "ZIPCODE": "POSTCODE", "PREFIX": "TITLE", "BUILDINGNUMBER": "BUILDING",
+    "SECONDARYADDRESS": "SECADDRESS", "PASSWORD": "PASS", "NEARBYGPSCOORDINATE": "GEOCOORD",
+    "GENDER": "SEX",
+}
+
+
 def one_at_a_time(sanitize):
     """Turn a single-text sanitizer into a batch sanitizer."""
     return lambda texts: [sanitize(t) for t in texts]

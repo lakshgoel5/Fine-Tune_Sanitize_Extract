@@ -52,6 +52,7 @@ python src/sanitize_eval.py --base_model Qwen/Qwen2.5-1.5B-Instruct --adapter_pa
 | `--quant {none,4bit}` | how the base model is loaded for `finetuned` (default `4bit`, matching A6) |
 | `--batch_size N` | generation batch size (default 16) |
 | `--limit N` | only evaluate the first N rows (quick checks) |
+| `--label_map ood` | for `partB_ood_test.jsonl`: rename its labels to the training schema; F1 on matched labels, leak rate on all PII |
 | `--rescore_from FILE` | re-score saved model outputs (re-runs span recovery and metrics, no generation) |
 
 ## Part C commands

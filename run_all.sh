@@ -56,7 +56,11 @@ python src/sanitize_eval.py --base_model "$MODEL" --test_file $TEST --system zer
 python src/sanitize_eval.py --base_model "$MODEL" --test_file $TEST --system zeroshot --num_shots 5 --batch_size 64 \
   --output_predictions results/partB/fewshot5_predictions.jsonl --report_file results/partB/fewshot5_metrics.json
 
-# TODO B.4: near-OOD evaluation (partB_ood_test.jsonl) once the label mapping is added.
+# B.4: near-OOD test set (different label names, mapped to the training schema for scoring)
+python src/sanitize_eval.py --base_model "$MODEL" --adapter_path adapters/best_sanitizer --quant 4bit \
+  --test_file data/partB_ood_test.jsonl --system finetuned --label_map ood --batch_size 64 \
+  --output_predictions results/partB/ood_predictions.jsonl --report_file results/partB/ood_metrics.json
+
 # ============================================================================
 # Part C
 # ============================================================================

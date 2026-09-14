@@ -18,7 +18,7 @@ from metrics import (
 )
 from partb_utils import (
     regex_sanitize, one_at_a_time, build_presidio_sanitize,
-    build_qwen_sanitize, pick_few_shot_examples,
+    build_qwen_sanitize, pick_few_shot_examples, OOD_LABEL_MAP,
 )
 
 
@@ -37,6 +37,8 @@ def parse_args():
     parser.add_argument("--train_file", type=str, default="data/partA_train.jsonl", help="Source of few-shot examples")
     parser.add_argument("--quant", type=str, default="4bit", choices=["none", "4bit"],
                         help="finetuned system: how to load the base model. Default 4bit because best_sanitizer is A6 (QLoRA)")
+    parser.add_argument("--label_map", type=str, default="none", choices=["none", "ood"],
+                        help="'ood': map partB_ood_test labels to the training schema before scoring")
     parser.add_argument("--rescore_from", type=str, default=None,
                         help="Model systems: re-score a saved predictions file (re-runs span recovery, no generation)")
     parser.add_argument("--seed", type=int, default=42)
@@ -95,6 +97,7 @@ def main():
 
     exact_counts, iou_counts = [], []
     n_leaked = n_gold = 0
+    leaks_by_group = {"mapped": [0, 0], "unmapped": [0, 0]}  # [leaked, total], only with --label_map
     n_altered = n_non_pii = 0
     n_well_formed = 0
     predictions = []
@@ -102,15 +105,32 @@ def main():
     for ex, (pred_text, pred_spans), latency_ms in zip(examples, outputs, latencies):
         gold = [asdict(s) for s in ex.privacy_mask]
 
-        # Entity F1: count tp/fp/fn per label under both matching rules.
-        exact_counts.append(match_spans_by_class(pred_spans, gold, mode="exact"))
-        iou_counts.append(match_spans_by_class(pred_spans, gold, mode="iou", iou_threshold=0.5))
+        # With --label_map ood: rename gold labels that have a match in our schema. F1 uses only
+        # those spans, and ignores predictions on PII types the model never saw (not false positives).
+        gold_f1, pred_f1 = gold, pred_spans
+        if args.label_map == "ood":
+            for g in gold:
+                g["mapped"] = g["label"] in OOD_LABEL_MAP
+                g["label"] = OOD_LABEL_MAP.get(g["label"], g["label"])
+            unmapped = [g for g in gold if not g["mapped"]]
+            gold_f1 = [g for g in gold if g["mapped"]]
+            pred_f1 = [p for p in pred_spans
+                       if not any(min(p.end, u["end"]) > max(p.start, u["start"]) for u in unmapped)]
 
-        # Leak rate: gold values still visible in the output.
+        # Entity F1: count tp/fp/fn per label under both matching rules.
+        exact_counts.append(match_spans_by_class(pred_f1, gold_f1, mode="exact"))
+        iou_counts.append(match_spans_by_class(pred_f1, gold_f1, mode="iou", iou_threshold=0.5))
+
+        # Leak rate: gold values still visible in the output (all gold spans, mapped or not).
         norm_pred = _normalize(pred_text)
         leaked_values = [g["value"] for g in gold if _normalize(g["value"]) in norm_pred]
         n_leaked += len(leaked_values)
         n_gold += len(gold)
+        if args.label_map == "ood":
+            for g in gold:
+                group = leaks_by_group["mapped" if g["mapped"] else "unmapped"]
+                group[0] += _normalize(g["value"]) in norm_pred
+                group[1] += 1
 
         # Over-masking: non-PII characters that got changed.
         altered, non_pii = over_masking_rate(ex.source_text, pred_text, gold)
@@ -149,6 +169,11 @@ def main():
         "over_masking_rate": n_altered / n_non_pii if n_non_pii else 0.0,
         "well_formed_rate": n_well_formed / len(examples) if examples else 0.0,
     }
+    if args.label_map == "ood":
+        report["label_map"] = "ood: F1 on gold labels with a counterpart in the training schema; leak rate on all gold spans"
+        for group, (leaked, total) in leaks_by_group.items():
+            report[f"leak_rate_{group}_labels"] = leaked / total if total else 0.0
+            report[f"n_gold_{group}_labels"] = total
 
     for path in (args.output_predictions, args.report_file):
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
