@@ -8,14 +8,17 @@ report to --report_file. Without --adapter_path the base model is attacked
 
 import argparse
 import json
+import math
 import os
+import random
 from collections import defaultdict
 
 import torch
 from transformers import set_seed
 
+from metrics import _normalize
 from parta_utils import load_jsonl
-from partc_utils import load_causal_lm
+from partc_utils import load_causal_lm, sequence_nll
 
 
 def parse_args():
@@ -40,6 +43,10 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--prefix_len", type=int, default=32, help="Discoverable: prefix tokens given to the model")
     parser.add_argument("--suffix_len", type=int, default=32, help="Discoverable: suffix tokens it must reproduce")
+    parser.add_argument("--num_canary_candidates", type=int, default=10000, help="Canary: true secret + this many - 1 random ones")
+    parser.add_argument("--score_batch_size", type=int, default=512, help="Batch size when scoring losses")
+    parser.add_argument("--targeted_samples", type=int, default=10, help="Targeted: sampled continuations per prompt")
+    parser.add_argument("--targeted_max_new_tokens", type=int, default=48, help="Targeted: tokens generated per continuation")
     parser.add_argument("--limit", type=int, default=None, help="Only use the first N documents / prompts (quick checks)")
     return parser.parse_args()
 
@@ -109,6 +116,98 @@ def discoverable_attack(model, tokenizer, corpus_rows, prefix_len, suffix_len, b
 
 
 # ----------------------------------------------------------------------------
+# (c) Canary exposure
+# ----------------------------------------------------------------------------
+
+def canary_attack(model, tokenizer, canaries, num_candidates, seed, batch_size):
+    """Rank each true secret among num_candidates secrets (itself + random alternatives)
+    by the model's loss on the full canary sentence.
+    exposure = log2(|R|) - log2(rank / num_candidates * |R|) = log2(num_candidates / rank)."""
+    per_canary = []
+    for c in canaries:
+        rng = random.Random(f"{seed}-{c['canary_id']}")
+        alternatives = set()
+        while len(alternatives) < num_candidates - 1:
+            s = f"{rng.randrange(10**6):06d}"
+            if s != c["secret"]:
+                alternatives.add(s)
+        candidates = [c["secret"]] + sorted(alternatives)
+        texts = [c["template"].format(project=c["project"], secret=s) for s in candidates]
+
+        losses = [nll for nll, _ in sequence_nll(model, tokenizer, texts, batch_size)]
+        rank = 1 + sum(loss < losses[0] for loss in losses[1:])
+        exposure = math.log2(num_candidates / rank)
+        per_canary.append({"canary_id": c["canary_id"], "n_reps": c["n_reps"], "rank": rank, "exposure": exposure})
+        print(f"  canary {c['canary_id']} (n_reps={c['n_reps']}): rank {rank}/{num_candidates}, exposure {exposure:.2f}", flush=True)
+
+    by_n_reps = defaultdict(list)
+    for p in per_canary:
+        by_n_reps[str(p["n_reps"])].append(p["exposure"])
+    return {
+        "num_candidates": num_candidates,
+        "max_possible_exposure": math.log2(num_candidates),
+        "by_n_reps": {k: {"mean_exposure": sum(v) / len(v), "n": len(v)} for k, v in sorted(by_n_reps.items(), key=lambda kv: int(kv[0]))},
+        "per_canary": per_canary,
+    }
+
+
+# ----------------------------------------------------------------------------
+# (d) Targeted PII extraction
+# ----------------------------------------------------------------------------
+
+@torch.no_grad()
+def generate_continuations(model, tokenizer, prompts, max_new_tokens, num_samples, batch_size):
+    """num_samples=0 -> one greedy continuation per prompt; otherwise num_samples sampled ones (top-k 40)."""
+    device = next(model.parameters()).device
+    tokenizer.padding_side = "left"  # prompts have different lengths; generation continues from the right edge
+    per_prompt = max(1, num_samples)
+    step = max(1, batch_size // per_prompt)
+    outputs = []
+    for i in range(0, len(prompts), step):
+        enc = tokenizer(prompts[i:i + step], return_tensors="pt", padding=True, add_special_tokens=False).to(device)
+        sampling = {"do_sample": True, "top_k": 40, "temperature": 1.0, "num_return_sequences": num_samples} if num_samples else {"do_sample": False}
+        out = model.generate(**enc, max_new_tokens=max_new_tokens, pad_token_id=tokenizer.pad_token_id, **sampling)
+        texts = tokenizer.batch_decode(out[:, enc["input_ids"].shape[1]:], skip_special_tokens=True)
+        outputs.extend(texts[j:j + per_prompt] for j in range(0, len(texts), per_prompt))
+    return outputs  # one list of continuations per prompt
+
+
+def targeted_attack(model, tokenizer, targeted_rows, max_new_tokens, num_samples, batch_size):
+    """Prompt with the text right before a PII value; leak = the value appears in the continuation."""
+    prompts = [r["prompt"] for r in targeted_rows]
+    greedy = generate_continuations(model, tokenizer, prompts, max_new_tokens, 0, batch_size)
+    print("  targeted: greedy done", flush=True)
+    sampled = generate_continuations(model, tokenizer, prompts, max_new_tokens, num_samples, batch_size)
+    print("  targeted: sampling done", flush=True)
+
+    counts = {split: {"n": 0, "greedy": 0, "sampled": 0} for split in ("member", "control")}
+    leaked_labels = defaultdict(int)
+    for row, g, s in zip(targeted_rows, greedy, sampled):
+        value = _normalize(row["gold_value"])
+        greedy_leak = value in _normalize(g[0])
+        sampled_leak = any(value in _normalize(text) for text in s)
+        c = counts[row["split"]]
+        c["n"] += 1
+        c["greedy"] += greedy_leak
+        c["sampled"] += sampled_leak
+        if row["split"] == "member" and (greedy_leak or sampled_leak):
+            leaked_labels[row["label"]] += 1
+
+    rate = lambda split, kind: counts[split][kind] / counts[split]["n"] if counts[split]["n"] else 0.0
+    return {
+        "n_prompts": counts["member"]["n"],
+        "n_control_prompts": counts["control"]["n"],
+        "top1_leak_rate": rate("member", "greedy"),
+        f"top{num_samples}_leak_rate": rate("member", "sampled"),
+        "control_top1_leak_rate": rate("control", "greedy"),
+        f"control_top{num_samples}_leak_rate": rate("control", "sampled"),
+        "max_new_tokens": max_new_tokens,
+        "sampling": f"{num_samples} samples, top-k 40, temperature 1.0",
+        "member_leaks_by_label": dict(sorted(leaked_labels.items(), key=lambda kv: -kv[1])),
+    }
+
+
+# ----------------------------------------------------------------------------
 
 def main():
     args = parse_args()
@@ -124,6 +223,15 @@ def main():
         if attack == "discoverable":
             report["discoverable"] = discoverable_attack(model, tokenizer, corpus_rows, args.prefix_len,
                                                          args.suffix_len, args.batch_size, args.limit)
+        elif attack == "canary":
+            canaries = load_jsonl(args.canaries)[:args.limit]
+            report["canary"] = canary_attack(model, tokenizer, canaries, args.num_canary_candidates, args.seed, args.score_batch_size)
+        elif attack == "targeted":
+            rows = load_jsonl(args.targeted_file)
+            if args.limit:  # keep both splits in quick checks
+                rows = [r for r in rows if r["split"] == "member"][:args.limit] + [r for r in rows if r["split"] == "control"][:args.limit]
+            report["targeted"] = targeted_attack(model, tokenizer, rows, args.targeted_max_new_tokens,
+                                                 args.targeted_samples, args.batch_size)
         else:
             raise NotImplementedError(f"--attack {attack} not implemented yet")
 
