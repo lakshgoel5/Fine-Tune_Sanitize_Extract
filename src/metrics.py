@@ -17,6 +17,9 @@ class PredSpan:
     label: str
 
 def _is_real_anchor(tag, i1, i2, source_text, min_equal_len):
+    # A genuine equal run: either long enough to be a trustworthy anchor,
+    # or short but non-alphanumeric (whitespace/punctuation -- a real
+    # separator, not a coincidental letter/digit match).
     if tag != "equal":
         return False
     if (i2 - i1) >= min_equal_len:
@@ -24,6 +27,23 @@ def _is_real_anchor(tag, i1, i2, source_text, min_equal_len):
     return not source_text[i1:i2].isalnum()
 
 def _coalesce_opcodes(opcodes, source_text: str, min_equal_len: int = 3):
+    """difflib.SequenceMatcher can find spurious short "equal" runs inside what
+    is semantically one replacement -- e.g. source "Marta Ruiz" vs predicted
+    "[GIVENNAME1]" share the single letter "M" (from "GIVENNA-M-E1]"), which
+    splits the real replacement into insert + equal('M') + replace, tearing the
+    [LABEL] tag itself in half across opcodes. Any single-opcode-at-a-time scan
+    then finds the tag in neither half and silently drops the whole span --
+    a real recall bug, not just a boundary-precision one.
+
+    This merges a short "equal" run into the surrounding non-equal region --
+    but ONLY when it's purely alphanumeric (a coincidental letter/digit match,
+    like the lone "M" above). A short equal run that's whitespace/punctuation
+    (", ", ". ", " ") is kept as a real anchor no matter how short: that's
+    almost always a genuine separator between two DISTINCT spans (e.g.
+    "[EMAIL], [TEL]"), and coalescing it would wrongly merge two separate PII
+    spans into one giant one -- a real bug this exact heuristic caused before
+    this alphanumeric check was added; verified via a regression test."""
+
     merged = []
     buf = None  # [i1, i2, j1, j2] of an in-progress merged non-equal region
     for tag, i1, i2, j1, j2 in opcodes:
@@ -100,14 +120,31 @@ def micro_prf1(tp: int, fp: int, fn: int) -> tuple[float, float, float]:
     f1 = 2 * p * r / (p + r) if (p + r) > 0 else 0.0
     return p, r, f1
 
-def is_match(p: PredSpan, g: dict) -> bool:
+def _spans_match(p: PredSpan, g: dict, mode: str, iou_threshold: float) -> bool:
+    """Part B.2: the general form of match_counts_iou -- greedy matching that
+    buckets tp/fp/fn PER CLASS (not just one summed triple), so callers can
+    derive micro F1 (sum buckets, one P/R/F1), macro F1 (average per-class F1),
+    and the per-class table all from the same accumulator.
+
+    mode="exact": span must match exactly (same start, end, AND label) --
+    B.2's first matching criterion.
+    mode="iou": IoU >= iou_threshold + label match -- B.2's second criterion
+    (same rule match_counts_iou implements, kept separate/untouched since
+    Part A's peft_sweep.py depends on that exact function).
+
+    Returns {label: [tp, fp, fn]}, covering every label seen in either
+    pred_spans or gold_spans for this one example. Caller sums these dicts
+    across the whole dataset before computing rates (never average per-example
+    rates -- that's not what micro/macro mean here).
+    """
+
     if g["label"] != p.label:
         return False
     if mode == "exact":
         return p.start == g["start"] and p.end == g["end"]
     return _iou(p.start, p.end, g["start"], g["end"]) >= iou_threshold
 
-def score(p: PredSpan, g: dict) -> float:
+def _match_score(p: PredSpan, g: dict, mode: str) -> float:
     return 1.0 if mode == "exact" else _iou(p.start, p.end, g["start"], g["end"])
 
 def match_spans_by_class(pred_spans: list[PredSpan], gold_spans: list[dict], mode: str = "iou", iou_threshold: float = 0.5) -> dict:
@@ -117,8 +154,8 @@ def match_spans_by_class(pred_spans: list[PredSpan], gold_spans: list[dict], mod
         best_j, best_score = None, -1.0
         for j in unmatched_gold:
             g = gold_spans[j]
-            if is_match(p, g):
-                s = score(p, g)
+            if _spans_match(p, g, mode, iou_threshold):
+                s = _match_score(p, g, mode)
                 if s > best_score:
                     best_j, best_score = j, s
         if best_j is not None:
@@ -132,6 +169,9 @@ def match_spans_by_class(pred_spans: list[PredSpan], gold_spans: list[dict], mod
 
 
 def merge_class_counts(*count_dicts: dict) -> dict:
+    """Sums several {label: [tp,fp,fn]} dicts (one per example) into one
+    dataset-level accumulator. Use this to fold match_spans_by_class's
+    per-example output across an entire test set before calling aggregate_prf1."""
     merged = defaultdict(lambda: [0, 0, 0])
     for counts in count_dicts:
         for label, (tp, fp, fn) in counts.items():
@@ -142,6 +182,12 @@ def merge_class_counts(*count_dicts: dict) -> dict:
 
 
 def aggregate_prf1(class_counts: dict) -> dict:
+    """From a dataset-level {label: [tp,fp,fn]} accumulator, compute micro
+    P/R/F1 (pool all classes, one P/R/F1), macro F1 (per-class F1, averaged
+    unweighted across classes), and the full per-class P/R/F1/support table.
+    Matches the "exact"/"overlap_iou50" sub-object shape in partB_metrics.json
+    (micro_p, micro_r, micro_f1, macro_f1) plus a per_class table callers can
+    sort by support and slice to the top 10 for the report."""
     tp_sum = sum(c[0] for c in class_counts.values())
     fp_sum = sum(c[1] for c in class_counts.values())
     fn_sum = sum(c[2] for c in class_counts.values())
@@ -160,6 +206,16 @@ def aggregate_prf1(class_counts: dict) -> dict:
 
 
 def over_masking_rate(source_text: str, predicted_text: str, gold_spans: list[dict]) -> tuple[int, int]:
+    """Part B.2: fraction of NON-PII source characters that were removed or
+    replaced. Diffs source_text against predicted_text (same technique as
+    recover_predicted_spans, run independently here since we need
+    character-level "was this position touched" rather than span groupings),
+    marks every character NOT covered by a gold span, and checks whether it
+    survived unchanged.
+
+    Returns (n_altered, n_total) over non-PII characters in THIS example --
+    caller sums both across the dataset before dividing, same accumulator
+    pattern as count_leaks."""
     gold_mask = [False] * len(source_text)
     for g in gold_spans:
         for i in range(max(0, g["start"]), min(g["end"], len(source_text))):
