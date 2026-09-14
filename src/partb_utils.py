@@ -138,10 +138,11 @@ def build_messages(source_text, shots):
     return messages
 
 
-def build_qwen_sanitize(base_model, adapter_path=None, shots=(), margin=32):
-    """adapter_path=None -> prompted base model; otherwise the fine-tuned sanitizer."""
+def build_qwen_sanitize(base_model, adapter_path=None, shots=(), quant="none", margin=32):
+    """adapter_path=None -> prompted base model; otherwise the fine-tuned sanitizer.
+    quant="4bit" loads the base the way QLoRA (A6) was trained."""
     import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
     tokenizer = AutoTokenizer.from_pretrained(base_model)
     if tokenizer.pad_token is None:
@@ -149,9 +150,15 @@ def build_qwen_sanitize(base_model, adapter_path=None, shots=(), margin=32):
     tokenizer.padding_side = "left"  # so every prompt in a batch ends at the same position
 
     use_cuda = torch.cuda.is_available()
+    dtype = torch.float16 if use_cuda else torch.float32
+    quant_config = None
+    if quant == "4bit":
+        # Same settings as peft_sweep.py used for A6.
+        quant_config = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=dtype, bnb_4bit_use_double_quant=True, bnb_4bit_quant_type="nf4")
     model = AutoModelForCausalLM.from_pretrained(
         base_model,
-        dtype=torch.float16 if use_cuda else torch.float32,
+        dtype=dtype,
+        quantization_config=quant_config,
         device_map="auto" if use_cuda else None,
     )
     if adapter_path:
