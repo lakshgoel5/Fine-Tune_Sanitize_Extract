@@ -11,12 +11,13 @@ import json
 import math
 import os
 import random
+import zlib
 from collections import defaultdict
 
 import torch
 from transformers import set_seed
 
-from metrics import _normalize
+from metrics import _normalize, recover_predicted_spans
 from parta_utils import load_jsonl
 from partc_utils import load_causal_lm, sequence_nll
 
@@ -45,6 +46,10 @@ def parse_args():
     parser.add_argument("--suffix_len", type=int, default=32, help="Discoverable: suffix tokens it must reproduce")
     parser.add_argument("--num_canary_candidates", type=int, default=10000, help="Canary: true secret + this many - 1 random ones")
     parser.add_argument("--score_batch_size", type=int, default=512, help="Batch size when scoring losses")
+    parser.add_argument("--sanitized_corpus", type=str, default="data/partC_corpus_sanitized.jsonl",
+                        help="Untargeted: used only to find which corpus strings are PII")
+    parser.add_argument("--untargeted_max_new_tokens", type=int, default=128, help="Untargeted: tokens per sample")
+    parser.add_argument("--min_pii_chars", type=int, default=6, help="Untargeted: ignore PII values shorter than this")
     parser.add_argument("--targeted_samples", type=int, default=10, help="Targeted: sampled continuations per prompt")
     parser.add_argument("--targeted_max_new_tokens", type=int, default=48, help="Targeted: tokens generated per continuation")
     parser.add_argument("--limit", type=int, default=None, help="Only use the first N documents / prompts (quick checks)")
@@ -208,6 +213,124 @@ def targeted_attack(model, tokenizer, targeted_rows, max_new_tokens, num_samples
 
 
 # ----------------------------------------------------------------------------
+# (b) Untargeted extraction with membership scoring
+# ----------------------------------------------------------------------------
+
+@torch.no_grad()
+def generate_samples(model, tokenizer, num_samples, max_new_tokens, batch_size):
+    """Unprompted samples: start from the end-of-text token, which preceded every
+    document during training, and sample with top-k 40."""
+    device = next(model.parameters()).device
+    tokenizer.padding_side = "left"
+    samples = []
+    while len(samples) < num_samples:
+        n = min(batch_size, num_samples - len(samples))
+        start = torch.full((n, 1), tokenizer.eos_token_id, device=device)
+        out = model.generate(input_ids=start, attention_mask=torch.ones_like(start), do_sample=True, top_k=40,
+                             temperature=1.0, max_new_tokens=max_new_tokens, pad_token_id=tokenizer.pad_token_id)
+        samples.extend(tokenizer.batch_decode(out[:, 1:], skip_special_tokens=True))
+        print(f"  untargeted: generated {len(samples)}/{num_samples}", flush=True)
+    return samples
+
+
+def mean_log_ppl(model, tokenizer, texts, batch_size):
+    """Log-perplexity per text = mean token negative log-likelihood."""
+    return [nll / max(n, 1) for nll, n in sequence_nll(model, tokenizer, texts, batch_size)]
+
+
+def build_window_index(corpus_rows, window):
+    """Every `window`-character substring of every distinct training text -> its doc_id."""
+    index = {}
+    for row in corpus_rows:
+        text = row["text"]
+        for i in range(len(text) - window + 1):
+            index.setdefault(text[i:i + window], row["doc_id"])
+    return index
+
+
+def matched_doc(sample, index, window):
+    """doc_id of a training document sharing a verbatim `window`-character substring with the sample, else None."""
+    for i in range(len(sample) - window + 1):
+        doc_id = index.get(sample[i:i + window])
+        if doc_id is not None:
+            return doc_id
+    return None
+
+
+def corpus_pii_strings(raw_rows, sanitized_rows, canaries, min_chars):
+    """PII values = the raw text the sanitizer replaced with a tag (the corpus has no
+    gold spans), plus canary secrets. Short values are dropped to avoid chance matches."""
+    sanitized = {}
+    for row in sanitized_rows:
+        sanitized.setdefault(row["doc_id"], row["text"])
+    strings = set()
+    done = set()
+    for row in raw_rows:
+        if row["doc_id"] in done or row["is_canary"]:
+            continue
+        done.add(row["doc_id"])
+        for span in recover_predicted_spans(row["text"], sanitized[row["doc_id"]]):
+            value = row["text"][span.start:span.end].strip()
+            if len(value) >= min_chars:
+                strings.add(value)
+    strings.update(c["secret"] for c in canaries)
+    return strings
+
+
+def untargeted_attack(model, tokenizer, ref_scorer, corpus_rows, pii_strings, num_samples, max_new_tokens,
+                      batch_size, score_batch_size, window=50, top_k=100):
+    samples = generate_samples(model, tokenizer, num_samples, max_new_tokens, batch_size)
+    unique = sorted({s for s in samples if s.strip()})
+
+    victim_lp = mean_log_ppl(model, tokenizer, unique, score_batch_size)
+    lower_lp = mean_log_ppl(model, tokenizer, [s.lower() for s in unique], score_batch_size)
+    ref_lp = ref_scorer(unique)
+    zlib_bytes = [len(zlib.compress(s.encode("utf-8"))) for s in unique]
+
+    # Lower score = more likely to be memorized training data, for all four scores.
+    scores = {
+        "ppl": victim_lp,
+        "ratio_ref": [v / max(r, 1e-6) for v, r in zip(victim_lp, ref_lp)],
+        "ratio_lower": [v / max(l, 1e-6) for v, l in zip(victim_lp, lower_lp)],
+        "ratio_zlib": [v / z for v, z in zip(victim_lp, zlib_bytes)],
+    }
+
+    index = build_window_index(corpus_rows, window)
+    matches = [matched_doc(s, index, window) for s in unique]
+
+    precision = {}
+    for name, values in scores.items():
+        top = sorted(range(len(unique)), key=lambda i: values[i])[:top_k]
+        precision[name] = sum(matches[i] is not None for i in top) / len(top) if top else 0.0
+
+    found_pii = {p for p in pii_strings if any(p in s for s in unique)}
+    return {
+        "n_generated": len(samples),
+        "n_unique": len(unique),
+        "precision_at_100": precision,
+        "n_samples_matching_training": sum(m is not None for m in matches),
+        "distinct_docs_recovered": len({m for m in matches if m is not None}),
+        "verified_pii_strings": len(found_pii),
+        "pii_recovery_rate": len(found_pii) / len(pii_strings) if pii_strings else 0.0,
+        "n_pii_strings_in_corpus": len(pii_strings),
+        "match_rule": f"shares a verbatim {window}-character substring with a training row",
+        "sampling": f"start from end-of-text token, top-k 40, temperature 1.0, {max_new_tokens} new tokens",
+    }
+
+
+# ----------------------------------------------------------------------------
+
+def make_ref_scorer(args, model, tokenizer):
+    """Log-perplexity under the reference model. If the reference is the victim's own base
+    model, reuse the loaded weights with the adapter switched off instead of loading them twice."""
+    if args.adapter_path and args.ref_model == args.victim_model:
+        def score(texts):
+            with model.disable_adapter():
+                return mean_log_ppl(model, tokenizer, texts, args.score_batch_size)
+        return score
+    ref_model, ref_tokenizer = load_causal_lm(args.ref_model)
+    return lambda texts: mean_log_ppl(ref_model, ref_tokenizer, texts, args.score_batch_size)
+
 
 def main():
     args = parse_args()
@@ -232,8 +355,12 @@ def main():
                 rows = [r for r in rows if r["split"] == "member"][:args.limit] + [r for r in rows if r["split"] == "control"][:args.limit]
             report["targeted"] = targeted_attack(model, tokenizer, rows, args.targeted_max_new_tokens,
                                                  args.targeted_samples, args.batch_size)
-        else:
-            raise NotImplementedError(f"--attack {attack} not implemented yet")
+        elif attack == "untargeted":
+            pii_strings = corpus_pii_strings(corpus_rows, load_jsonl(args.sanitized_corpus), load_jsonl(args.canaries),
+                                             args.min_pii_chars)
+            report["untargeted"] = untargeted_attack(model, tokenizer, make_ref_scorer(args, model, tokenizer), corpus_rows,
+                                                     pii_strings, args.limit or args.num_samples, args.untargeted_max_new_tokens,
+                                                     args.batch_size, args.score_batch_size)
 
     os.makedirs(os.path.dirname(args.report_file) or ".", exist_ok=True)
     with open(args.report_file, "w") as f:
