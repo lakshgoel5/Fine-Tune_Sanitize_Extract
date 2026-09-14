@@ -10,7 +10,6 @@ import csv
 import os
 import time
 from dataclasses import dataclass, asdict
-import wandb
 
 import torch
 from torch.utils.data import Dataset
@@ -270,6 +269,7 @@ def main():
     set_seed(args.seed)
 
     if args.wandb:
+        import wandb  # optional: only needed with --wandb
         wandb.init(project="col873-a1-parta", name=args.run_id, config=vars(args))
 
     # Tokenizer
@@ -367,6 +367,7 @@ def main():
 
     # Wandb
     if args.wandb:
+        import wandb
         wandb.log(row)
         wandb.finish()
     return

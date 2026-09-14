@@ -19,7 +19,7 @@ from transformers import set_seed
 
 from metrics import _normalize, recover_predicted_spans
 from parta_utils import load_jsonl
-from partc_utils import load_causal_lm, sequence_nll
+from partc_utils import load_causal_lm, perplexity, sequence_nll
 
 
 def parse_args():
@@ -30,12 +30,12 @@ def parse_args():
     parser.add_argument("--ref_model", type=str, required=True,
                         help="Reference (un-fine-tuned) model for membership scoring")
     parser.add_argument("--corpus", type=str, required=True, help="Path to partC_corpus_raw.jsonl")
-    parser.add_argument("--heldout", type=str, default=None, help="Path to partC_heldout.jsonl") # Custom add
+    parser.add_argument("--heldout", type=str, default="data/partC_heldout.jsonl", help="Path to partC_heldout.jsonl (skipped if missing)") # Custom add
     parser.add_argument("--canaries", type=str, required=True, help="Path to partC_canaries.jsonl")
     parser.add_argument("--targeted_file", type=str, required=True, help="Path to partC_targeted.jsonl")
     parser.add_argument("--attack", type=str, required=True,
-                        choices=["discoverable", "untargeted", "canary", "targeted", "all"],
-                        help="Which attack(s) to run")
+                        choices=["discoverable", "untargeted", "canary", "targeted", "utility", "all"],
+                        help="Which attack(s) to run; 'utility' = held-out perplexity only")
     parser.add_argument("--num_samples", type=int, default=5000,
                         help="Number of samples to generate for the untargeted extraction attack")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
@@ -47,7 +47,10 @@ def parse_args():
     parser.add_argument("--num_canary_candidates", type=int, default=10000, help="Canary: true secret + this many - 1 random ones")
     parser.add_argument("--score_batch_size", type=int, default=512, help="Batch size when scoring losses")
     parser.add_argument("--sanitized_corpus", type=str, default="data/partC_corpus_sanitized.jsonl",
-                        help="Untargeted: used only to find which corpus strings are PII")
+                        help="Untargeted: used only to find which corpus strings are PII; if missing, the "
+                             "targeted-file gold values and canary secrets are used instead")
+    parser.add_argument("--sanitized_heldout", type=str, default=None,
+                        help="Utility: also report perplexity on the sanitized held-out set")
     parser.add_argument("--untargeted_max_new_tokens", type=int, default=128, help="Untargeted: tokens per sample")
     parser.add_argument("--min_pii_chars", type=int, default=6, help="Untargeted: ignore PII values shorter than this")
     parser.add_argument("--targeted_samples", type=int, default=10, help="Targeted: sampled continuations per prompt")
@@ -187,6 +190,7 @@ def targeted_attack(model, tokenizer, targeted_rows, max_new_tokens, num_samples
 
     counts = {split: {"n": 0, "greedy": 0, "sampled": 0} for split in ("member", "control")}
     leaked_labels = defaultdict(int)
+    leaked_ids = []
     for row, g, s in zip(targeted_rows, greedy, sampled):
         value = _normalize(row["gold_value"])
         greedy_leak = value in _normalize(g[0])
@@ -197,6 +201,7 @@ def targeted_attack(model, tokenizer, targeted_rows, max_new_tokens, num_samples
         c["sampled"] += sampled_leak
         if row["split"] == "member" and (greedy_leak or sampled_leak):
             leaked_labels[row["label"]] += 1
+            leaked_ids.append(row["id"])  # ids only; the values stay out of the report
 
     rate = lambda split, kind: counts[split][kind] / counts[split]["n"] if counts[split]["n"] else 0.0
     return {
@@ -209,6 +214,7 @@ def targeted_attack(model, tokenizer, targeted_rows, max_new_tokens, num_samples
         "max_new_tokens": max_new_tokens,
         "sampling": f"{num_samples} samples, top-k 40, temperature 1.0",
         "member_leaks_by_label": dict(sorted(leaked_labels.items(), key=lambda kv: -kv[1])),
+        "leaked_member_ids": leaked_ids,
     }
 
 
@@ -338,12 +344,18 @@ def main():
 
     model, tokenizer = load_causal_lm(args.victim_model, args.adapter_path)
     corpus_rows = load_jsonl(args.corpus)
-    attacks = ["discoverable", "untargeted", "canary", "targeted"] if args.attack == "all" else [args.attack]
+    attacks = ["utility", "discoverable", "untargeted", "canary", "targeted"] if args.attack == "all" else [args.attack]
 
     report = {"victim": os.path.basename(os.path.normpath(args.adapter_path)) if args.adapter_path else "base",
               "corpus": os.path.basename(args.corpus)}
     for attack in attacks:
-        if attack == "discoverable":
+        if attack == "utility":
+            if args.heldout and os.path.exists(args.heldout):
+                report["heldout_ppl"] = perplexity(model, tokenizer, [r["text"] for r in load_jsonl(args.heldout)])
+            if args.sanitized_heldout and os.path.exists(args.sanitized_heldout):
+                report["heldout_ppl_sanitized"] = perplexity(model, tokenizer, [r["text"] for r in load_jsonl(args.sanitized_heldout)])
+            print(f"  utility: {report.get('heldout_ppl')} / sanitized {report.get('heldout_ppl_sanitized')}", flush=True)
+        elif attack == "discoverable":
             report["discoverable"] = discoverable_attack(model, tokenizer, corpus_rows, args.prefix_len,
                                                          args.suffix_len, args.batch_size, args.limit)
         elif attack == "canary":
@@ -356,11 +368,20 @@ def main():
             report["targeted"] = targeted_attack(model, tokenizer, rows, args.targeted_max_new_tokens,
                                                  args.targeted_samples, args.batch_size)
         elif attack == "untargeted":
-            pii_strings = corpus_pii_strings(corpus_rows, load_jsonl(args.sanitized_corpus), load_jsonl(args.canaries),
-                                             args.min_pii_chars)
+            if os.path.exists(args.sanitized_corpus):
+                pii_strings = corpus_pii_strings(corpus_rows, load_jsonl(args.sanitized_corpus), load_jsonl(args.canaries),
+                                                 args.min_pii_chars)
+                pii_source = "raw values replaced by the sanitizer + canary secrets"
+            else:
+                pii_strings = {r["gold_value"] for r in load_jsonl(args.targeted_file)
+                               if r["split"] == "member" and len(r["gold_value"]) >= args.min_pii_chars}
+                pii_strings |= {c["secret"] for c in load_jsonl(args.canaries)}
+                pii_source = "targeted member gold values + canary secrets (sanitized corpus not found)"
+            print(f"  untargeted: {len(pii_strings)} PII strings from {pii_source}", flush=True)
             report["untargeted"] = untargeted_attack(model, tokenizer, make_ref_scorer(args, model, tokenizer), corpus_rows,
                                                      pii_strings, args.limit or args.num_samples, args.untargeted_max_new_tokens,
                                                      args.batch_size, args.score_batch_size)
+            report["untargeted"]["pii_source"] = pii_source
 
     os.makedirs(os.path.dirname(args.report_file) or ".", exist_ok=True)
     with open(args.report_file, "w") as f:

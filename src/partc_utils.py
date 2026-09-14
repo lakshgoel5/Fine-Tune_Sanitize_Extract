@@ -29,15 +29,23 @@ def load_causal_lm(model_name, adapter_path=None, quant="none"):
 
 
 @torch.no_grad()
-def sequence_nll(model, tokenizer, texts, batch_size=32):
+def sequence_nll(model, tokenizer, texts, batch_size=32, max_batch_tokens=8192):
     """For each text: (sum of token negative log-likelihoods, number of scored tokens).
-    Every token except the first is scored (Qwen has no BOS token to condition on)."""
+    Every token except the first is scored (Qwen has no BOS token to condition on).
+    A batch is also capped at max_batch_tokens (texts x padded length), because the
+    vocabulary-sized logits grow with every token: 512 x 128 tokens needed ~40 GB."""
     device = next(model.parameters()).device
     tokenizer.padding_side = "right"  # real tokens keep positions 0..n-1; pads sit at the end and are masked
     results = []
-    for i in range(0, len(texts), batch_size):
+    i = 0
+    while i < len(texts):
         batch = texts[i:i + batch_size]
-        enc = tokenizer(batch, return_tensors="pt", padding=True).to(device)
+        enc = tokenizer(batch, return_tensors="pt", padding=True)
+        while enc["input_ids"].numel() > max_batch_tokens and len(batch) > 1:
+            batch = batch[:len(batch) // 2]
+            enc = tokenizer(batch, return_tensors="pt", padding=True)
+        i += len(batch)
+        enc = enc.to(device)
         logits = model(**enc).logits.float()
 
         # Position t predicts token t+1.
@@ -81,11 +89,42 @@ def plot_exposure(report_files, names, output):
     print(f"Saved {output}")
 
 
+def merge_reports(report_dir, output, models=("raw", "san", "base"),
+                  parts=("all", "utility", "discoverable", "untargeted", "canary", "targeted")):
+    """Combine <report_dir>/<model>_<part>.json files (one --attack all file, or one file per
+    attack from parallel jobs). The output keeps the spec's single-object shape for the first
+    model (V-raw); the other models go under extra keys ("victim_san", "control")."""
+    import json
+    import os
+
+    merged = []
+    for m in models:
+        combined = {}
+        for part in parts:
+            path = os.path.join(report_dir, f"{m}_{part}.json")
+            if os.path.exists(path):
+                with open(path) as f:
+                    combined.update(json.load(f))
+        print(f"{m}: {sorted(k for k in combined if k not in ('victim', 'corpus'))}")
+        merged.append(combined)
+    result = dict(merged[0])
+    for name, combined in zip(("victim_san", "control"), merged[1:]):
+        result[name] = combined
+    with open(output, "w") as f:
+        json.dump(result, f, indent=2)
+    print(f"Saved {output}")
+
+
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="Part C plots")
-    parser.add_argument("--reports", nargs="+", required=True, help="Attack report JSON files")
-    parser.add_argument("--names", nargs="+", required=True, help="Legend name for each report")
-    parser.add_argument("--output", type=str, default="results/partC_exposure.png")
+    parser = argparse.ArgumentParser(description="Part C plot and report merging")
+    parser.add_argument("--mode", choices=["plot", "merge"], default="plot")
+    parser.add_argument("--reports", nargs="+", help="plot: attack report JSON files with a 'canary' section")
+    parser.add_argument("--names", nargs="+", help="plot: legend name for each report")
+    parser.add_argument("--report_dir", type=str, default="results/partC", help="merge: folder with <model>_<attack>.json")
+    parser.add_argument("--output", type=str, default=None)
     args = parser.parse_args()
-    plot_exposure(args.reports, args.names, args.output)
+    if args.mode == "plot":
+        plot_exposure(args.reports, args.names, args.output or "results/partC_exposure.png")
+    else:
+        merge_reports(args.report_dir, args.output or "results/partC_attacks.json")
