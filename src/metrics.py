@@ -64,24 +64,35 @@ def _coalesce_opcodes(opcodes, source_text: str, min_equal_len: int = 3):
     return merged
 
 
+PLACEHOLDER_BASE = 0xE000  # Unicode private-use area; never occurs in the data
+
+
 def recover_predicted_spans(source_text: str, predicted_text: str) -> list[PredSpan]:
     """Align predicted_text against source_text and turn each replaced gap
     that contains a [LABEL] tag into a (start, end, label) span in
     source_text's coordinate system.
+
+    Each tag is first collapsed to one placeholder character, so the diff can
+    never split a tag or pair its letters/brackets with source characters
+    (e.g. "[52.2, -1.2]" -> "[GEOCOORD]" would otherwise keep both brackets as
+    "equal" and leave a bracketless "GEOCOORD" that no longer looks like a tag).
     """
-    sm = difflib.SequenceMatcher(None, source_text, predicted_text, autojunk=False)
+    labels = []
+
+    def to_placeholder(m):
+        labels.append(m.group(1))
+        return chr(PLACEHOLDER_BASE + len(labels) - 1)
+
+    compact = TAG_RE.sub(to_placeholder, predicted_text)
+    sm = difflib.SequenceMatcher(None, source_text, compact, autojunk=False)
     spans: list[PredSpan] = []
     for tag, i1, i2, j1, j2 in _coalesce_opcodes(sm.get_opcodes(), source_text):
-        if tag == "equal":
-            continue
-        # i1:i2 is the gap in source_text; j1:j2 is what replaced it in predicted_text.
-        if i1 == i2:
-            continue  # pure insertion in predicted_text, nothing to redact in source
-        chunk = predicted_text[j1:j2]
-        m = TAG_RE.search(chunk)
-        if m is None:
-            continue  # replaced but not with a recognizable [LABEL] tag
-        spans.append(PredSpan(start=i1, end=i2, label=m.group(1)))
+        if tag == "equal" or i1 == i2:
+            continue  # unchanged text, or an insertion with nothing removed from source
+        tag_ids = [ord(c) - PLACEHOLDER_BASE for c in compact[j1:j2] if 0 <= ord(c) - PLACEHOLDER_BASE < len(labels)]
+        if not tag_ids:
+            continue  # source text changed, but not replaced by a tag
+        spans.append(PredSpan(start=i1, end=i2, label=labels[tag_ids[0]]))
     return spans
 
 
