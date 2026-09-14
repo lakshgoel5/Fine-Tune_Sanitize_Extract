@@ -197,7 +197,10 @@ def aggregate_prf1(class_counts: dict) -> dict:
     for label, (tp, fp, fn) in class_counts.items():
         p, r, f1 = micro_prf1(tp, fp, fn)
         per_class[label] = {"p": p, "r": r, "f1": f1, "support": tp + fn}
-    macro_f1 = sum(c["f1"] for c in per_class.values()) / len(per_class) if per_class else 0.0
+    # Macro averages over gold PII classes only; predictions with invented labels
+    # still count as false positives in micro, but don't add zero-F1 classes here.
+    gold_classes = [c for c in per_class.values() if c["support"] > 0]
+    macro_f1 = sum(c["f1"] for c in gold_classes) / len(gold_classes) if gold_classes else 0.0
 
     return {
         "micro_p": micro_p, "micro_r": micro_r, "micro_f1": micro_f1,
