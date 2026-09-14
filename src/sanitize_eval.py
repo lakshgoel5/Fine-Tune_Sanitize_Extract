@@ -14,7 +14,7 @@ from dataclasses import asdict
 from parta_utils import load_jsonl, parse_examples
 from metrics import (
     match_spans_by_class, merge_class_counts, aggregate_prf1,
-    over_masking_rate, is_well_formed, _normalize,
+    over_masking_rate, is_well_formed, _normalize, recover_predicted_spans,
 )
 from partb_utils import (
     regex_sanitize, one_at_a_time, build_presidio_sanitize,
@@ -37,6 +37,8 @@ def parse_args():
     parser.add_argument("--train_file", type=str, default="data/partA_train.jsonl", help="Source of few-shot examples")
     parser.add_argument("--quant", type=str, default="4bit", choices=["none", "4bit"],
                         help="finetuned system: how to load the base model. Default 4bit because best_sanitizer is A6 (QLoRA)")
+    parser.add_argument("--rescore_from", type=str, default=None,
+                        help="Model systems: re-score a saved predictions file (re-runs span recovery, no generation)")
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
 
@@ -73,17 +75,23 @@ def main():
     args = parse_args()
     set_seed(args.seed)
     examples = parse_examples(load_jsonl(args.test_file))[:args.limit]
-    sanitize_batch = build_sanitizer(args)
 
-    # Run the sanitizer over batches; per-example latency = batch time / batch size.
-    outputs, latencies = [], []
-    start = time.time()
-    for i in range(0, len(examples), args.batch_size):
-        batch = examples[i:i + args.batch_size]
-        t0 = time.time()
-        outputs.extend(sanitize_batch([ex.source_text for ex in batch]))
-        latencies.extend([(time.time() - t0) * 1000 / len(batch)] * len(batch))
-        print(f"  {len(outputs)}/{len(examples)} done  ({time.time() - start:.0f}s)", flush=True)
+    if args.rescore_from:
+        # Reuse saved model outputs (and their latencies); only span recovery + scoring re-run.
+        saved = {row["id"]: row for row in load_jsonl(args.rescore_from)}
+        outputs = [(saved[ex.id]["predicted_text"], recover_predicted_spans(ex.source_text, saved[ex.id]["predicted_text"])) for ex in examples]
+        latencies = [saved[ex.id]["latency_ms"] for ex in examples]
+    else:
+        sanitize_batch = build_sanitizer(args)
+        # Run the sanitizer over batches; per-example latency = batch time / batch size.
+        outputs, latencies = [], []
+        start = time.time()
+        for i in range(0, len(examples), args.batch_size):
+            batch = examples[i:i + args.batch_size]
+            t0 = time.time()
+            outputs.extend(sanitize_batch([ex.source_text for ex in batch]))
+            latencies.extend([(time.time() - t0) * 1000 / len(batch)] * len(batch))
+            print(f"  {len(outputs)}/{len(examples)} done  ({time.time() - start:.0f}s)", flush=True)
 
     exact_counts, iou_counts = [], []
     n_leaked = n_gold = 0
