@@ -35,6 +35,8 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=16, help="Generation batch size (model systems)")
     parser.add_argument("--num_shots", type=int, default=0, help="zeroshot system: 0 = zero-shot, 5 = 5-shot")
     parser.add_argument("--train_file", type=str, default="data/partA_train.jsonl", help="Source of few-shot examples")
+    parser.add_argument("--quant", type=str, default="4bit", choices=["none", "4bit"],
+                        help="finetuned system: how to load the base model. Default 4bit because best_sanitizer is A6 (QLoRA)")
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
 
@@ -50,7 +52,7 @@ def build_sanitizer(args):
     if args.system == "finetuned":
         if not args.adapter_path:
             raise ValueError("--system finetuned needs --adapter_path")
-        return build_qwen_sanitize(args.base_model, adapter_path=args.adapter_path)
+        return build_qwen_sanitize(args.base_model, adapter_path=args.adapter_path, quant=args.quant)
 
 
 def set_seed(seed):
@@ -128,6 +130,7 @@ def main():
         "system": args.system,
         "adapter": args.adapter_path,
         "num_shots": args.num_shots if args.system == "zeroshot" else None,
+        "quant": args.quant if args.system == "finetuned" else None,
         "test_set": os.path.basename(args.test_file),
         "n": len(examples),
         "exact": {k: exact[k] for k in summary_keys},
