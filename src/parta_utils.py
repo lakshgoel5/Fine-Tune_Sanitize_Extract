@@ -160,7 +160,7 @@ def plot(results_csv, output_dir):
     ax.grid(True, alpha=0.3)
  
     fig.tight_layout()
-    output_img = f"{output_dir}/partA_sweep.png"
+    output_img = f"{output_dir}/partA_fig.png"
     fig.savefig(output_img, dpi=150)
     print(f"Saved figure to {output_img}")
 
