@@ -25,13 +25,14 @@
 \maketitle
 \vspace{-2em}
 
-\noindent\textbf{Adapter weights:} \href{https://drive.google.com/drive/folders/12jnfl4Zaum3CU9o4sL7jN7CmvDe209c2?usp=drive_link}{Google Drive folder}.
-\texttt{PartA/} holds the six sweep adapters A1--A6 (zipped); \texttt{PartB/} holds \texttt{best\_sanitizer} (a copy of A6). The A5 adapter used for the LoRA-vs-QLoRA comparison in Part B is in \texttt{PartA/}.
+\noindent\textbf{Adapter weights:} \href{https://huggingface.co/lakshgoel/col873-A1-adapters}{hf link}.
+\texttt{PartA/} holds the six sweep adapters A1--A6; \texttt{PartB/} holds \texttt{best\_sanitizer} (a copy of A6). The A5 adapter used for the LoRA-vs-QLoRA comparison in Part B is in \texttt{PartA/}. Victim models are not uploaded per the assignment rules; run\_all.sh retrains them.
 
 % =====================================================
 \section{Part A}
 
 \subsection{Setup}
+Our A4/A5 labels are swapped relative to the assignment table (our A4 = r32, $\alpha$ 16; our A5 = r32, $\alpha$64)
 \begin{itemize}
   \item Base model: \texttt{Qwen/Qwen2.5-1.5B-Instruct}; task: map \texttt{source\_text} $\to$ \texttt{target\_text}, loss masked to completion tokens only.
   \item Data: \texttt{data/partA\_train.jsonl} (20{,}000), \texttt{data/partA\_validation.jsonl} (2{,}000), used in full and unmodified.
@@ -291,8 +292,15 @@ V-san & 15.62 & \textbf{0.269 / 0.185} & 0.97 & \textbf{112} & \textbf{2.12}  & 
 \end{itemize}
 
 % =====================================================
-\section{What Would You Do Next?}
-Four defences, each aimed at a failure we measured: \textbf{(1) deduplicate} the training data, since every document seen 8+ times was memorized completely; \textbf{(2) add a rule-based pass for secrets} (long digit strings, codes, keys) after the model sanitizer, since the one leaked canary was a plain 6-digit code the model did not recognise; \textbf{(3) test before release} by planting canaries and running the exposure and targeted attacks, releasing only if both stay at base level, which would have caught \texttt{canary\_05}; \textbf{(4) differentially private fine-tuning} (DP-SGD) to limit memorization of any single document when the sanitizer misses something, at some utility cost.
+\section*{Honour Code}
+\noindent\textit{``Even though I have taken help from the following students and LLMs in terms of discussing ideas and coding practices, all my code is written by me.''}
+
+\vspace{0.5em}
+\noindent \textbf{Students consulted:} None
+
+\noindent \textbf{LLMs / tools used:}
+Claude Code
+
 
 \clearpage
 % =====================================================
@@ -307,7 +315,7 @@ Four defences, each aimed at a failure we measured: \textbf{(1) deduplicate} the
 \label{fig:partA-cost}
 \end{figure}
 
-\subsection{B.1 span recovery: failure modes and their effect}\label{app:b1}
+\subsection{Span recovery: failure modes and their effect}\label{app:b1}
 \textbf{Failure modes.} Three problems showed up while checking the outputs; the first two are fixed by rule 1, the third by rule 2.
 \begin{itemize}
   \item \textbf{Brackets inside the value.} For \texttt{[52.2, -1.2]} $\to$ \texttt{[GEOCOORD]}, the brackets of the value were matched with the brackets of the tag, so the tag was not recognised. All 48 GEOCOORD spans and 56 passwords containing brackets were lost.
@@ -332,7 +340,7 @@ No fixes & 0.816 & \textbf{0.954} & 0.712 \\
 
 \noindent Part A's validation F1 was computed before these fixes. That is why A6 has 0.815 on validation but 0.954 on test: with the unfixed code, test F1 is also 0.816 (A5: 0.809 vs.\ 0.807 on validation). So the model is not worse on validation; the old scorer lost about a quarter of the correct spans. All Part A runs were scored the same way, so they can still be compared with each other, but their F1 values are too low. Leak rate does not use spans, so Part A leak rates are correct.
 
-\subsection{B.2 metric definitions and B.3 baseline details}\label{app:b2}
+\subsection{Metric definitions and baseline details}\label{app:b2}
 \begin{itemize}
   \item \textbf{Precision / recall / F1.} A predicted span is correct if it has the same label as a gold span and either the exact same boundaries (exact) or an overlap of IoU $\ge$ 0.5 (overlap). Micro F1 counts all spans together. Macro F1 averages the F1 of the 27 gold labels. Spans with invented labels count as wrong in micro F1 but are not added as extra labels to the macro average.
   \item \textbf{Leak rate.} Share of gold PII values that still appear in the output (ignoring case and extra spaces).
@@ -349,7 +357,7 @@ No fixes & 0.816 & \textbf{0.954} & 0.712 \\
   \item \textbf{Qwen2.5-1.5B-Instruct without fine-tuning}, zero-shot and 5-shot. The 5 examples are the first 5 short rows ($\le$300 characters) of the training set.
 \end{itemize}
 
-\subsection{B.2 per-class results for A6}\label{app:perclass}
+\subsection{Per-class results for A6}\label{app:perclass}
 \begin{table}[h!]
 \centering
 \caption{A6 results for the 10 most frequent labels.}
@@ -374,7 +382,7 @@ SEX & 529 & 0.976 & 0.985 & 0.980 & 0.976 & 0.985 & 0.980 \\
 
 \noindent LASTNAME1 is the weakest label (F1 0.90), mostly because last names get called first names (16) or second last names (10). PASSPORT has lower precision (0.90) because other ID numbers get tagged as PASSPORT (driver licence 18, SSN 11, ID card 10).
 
-\subsection{C.3(c) canary exposure numbers}\label{app:canary}
+\subsection{Part C attack tables}\label{app:canary}
 \begin{table}[h!]
 \centering
 \caption{Mean exposure by number of copies (maximum measurable: 13.29). Bold: lower exposure of V-raw and V-san.}
@@ -389,15 +397,5 @@ V-san & \textbf{2.47} & \textbf{3.45} & \textbf{1.28} & \textbf{1.27} \\
 \bottomrule
 \end{tabular}
 \end{table}
-
-% =====================================================
-\section*{Honour Code}
-\noindent\textit{``Even though I have taken help from the following students and LLMs in terms of discussing ideas and coding practices, all my code is written by me.''}
-
-\vspace{0.5em}
-\noindent \textbf{Students consulted:} None
-
-\noindent \textbf{LLMs / tools used:}
-Claude Code
 
 \end{document}
