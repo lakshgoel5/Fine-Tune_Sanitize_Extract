@@ -8,6 +8,10 @@ MODEL=${MODEL:-Qwen/Qwen2.5-1.5B-Instruct}
 TEST=data/partB_test.jsonl
 mkdir -p results/partB logs
 
+# =======
+# HF downlaod
+bash hf_download.sh
+
 # ============================================================================
 # Part A: PEFT sweep (6 runs, each appends one row to results/partA_sweep.csv)
 # ============================================================================
